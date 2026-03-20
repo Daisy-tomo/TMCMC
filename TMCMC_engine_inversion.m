@@ -167,81 +167,134 @@ function [y, aux] = engine_forward(theta_s, theta_f, cond)
     % theta_s: [eta_k, eta_t, eta_T, eta_m]
     % theta_f: [lambda, eta_v, eta_tv, eta_c1, eta_c2,
     %           sigma_cc, sigma_kan, sigma_kask, sigma_ks]
-    eta_k=theta_s(1); eta_t=theta_s(2); eta_T=theta_s(3); eta_m=theta_s(4);
-    lambda=theta_f(1); eta_v=theta_f(2); eta_tv=theta_f(3);
-    eta_c1=theta_f(4); eta_c2=theta_f(5);
-    sigma_cc=theta_f(6); sigma_kan=theta_f(7);
-    sigma_kask=theta_f(8); sigma_ks=theta_f(9);
+    eta_k  = theta_s(1);
+    eta_t  = theta_s(2);
+    eta_T  = theta_s(3);
+    eta_m  = theta_s(4);
+    lambda     = theta_f(1);
+    eta_v      = theta_f(2);
+    eta_tv     = theta_f(3);
+    eta_c1     = theta_f(4);
+    eta_c2     = theta_f(5);
+    sigma_cc   = theta_f(6);
+    sigma_kan  = theta_f(7);
+    sigma_kask = theta_f(8);
+    sigma_ks   = theta_f(9);
 
-    T_H=cond.T_H; M_f=cond.M_flight; m=cond.m;
-    pi_k=cond.pi_k; T_g=cond.T_g;
+    T_H      = cond.T_H;
+    M_flight = cond.M_flight;
+    m        = cond.m;
+    pi_k     = cond.pi_k;
+    T_g      = cond.T_g;
 
-    y=[NaN,NaN]; aux=struct();
+    y   = [NaN, NaN];
+    aux = struct();
     try
-        k=1.4; R_a=287.3;
-        a_s = sqrt(k*R_a*T_H);
-        if ~isfinite(a_s)||a_s<=0, return; end
-        V_f = a_s*M_f;
+        % (1) 基本常数
+        k_air = 1.4;
+        R_air = 287.3;
+        a = sqrt(k_air * R_air * T_H);
+        if ~isfinite(a) || a <= 0, return; end
+        V_flight = a * M_flight;
 
-        kT=piecewise_kT(T_g); RT_g=piecewise_RT(T_g); d=delta_cooling(T_g);
+        % (2) 分段函数值
+        kT = piecewise_kT(T_g);
+        RT = piecewise_RT(T_g);
+        d  = delta_cooling(T_g);
 
-        inner = 1 + V_f^2/(2*(k/(k-1))*R_a*T_H);
-        if inner<=0, return; end
-        tau_v = inner^(k/(k-1));
-        T_B   = T_H*(inner^k);
-        if ~isfinite(T_B)||T_B<=0, return; end
+        % (3) 进口总压比与压气机入口温度
+        inner = 1 + V_flight^2 / (2 * (k_air/(k_air-1)) * R_air * T_H);
+        if inner <= 0, return; end
+        tau_v = inner^(k_air / (k_air - 1));
+        T_B   = T_H * (inner^k_air);
+        if ~isfinite(T_B) || T_B <= 0, return; end
 
-        pi_r = pi_k^((k-1)/k);
-        if ~isfinite(pi_r)||pi_r<1, return; end
-        T_k = T_B*(1+(pi_r-1)/eta_k);
-        if ~isfinite(T_k)||T_k<=0, return; end
+        % (4) 压气机出口温度
+        pi_k_ratio = pi_k^((k_air-1)/k_air);
+        if ~isfinite(pi_k_ratio) || pi_k_ratio < 1, return; end
+        T_k = T_B * (1 + (pi_k_ratio - 1) / eta_k);
+        if ~isfinite(T_k) || T_k <= 0, return; end
 
-        g_T = 3e-5*T_g - 2.69e-5*T_k - 0.003;
-        if ~isfinite(g_T)||g_T<=0, return; end
+        % (5) 相对耗油量
+        g_T = 3e-5 * T_g - 2.69e-5 * T_k - 0.003;
+        if ~isfinite(g_T) || g_T <= 0
+            return;
+        end
 
-        W_k  = (k/(k-1))*R_a*T_B*(pi_r-1);
-        H_g  = (kT/(kT-1))*RT_g*T_g;
-        if abs(H_g)<1e-6, return; end
-        num_lh = 1 - W_k/(H_g*eta_k);
-        den_lh = 1 - W_k/(H_g*eta_k*eta_t);
-        if abs(den_lh)<1e-10, return; end
-        lh = num_lh/den_lh;
-        if ~isfinite(lh), return; end
+        % (6) 热恢复系数
+        compress_work = (k_air/(k_air-1)) * R_air * T_B * (pi_k_ratio - 1);
+        gas_enthalpy  = (kT/(kT-1)) * RT * T_g;
+        if abs(gas_enthalpy) < 1e-6, return; end
+        num_lambda  = 1 - compress_work / (gas_enthalpy * eta_k);
+        den_lambda  = 1 - compress_work / (gas_enthalpy * eta_k * eta_t);
+        if abs(den_lambda) < 1e-10, return; end
+        lambda_heat = num_lambda / den_lambda;
+        if ~isfinite(lambda_heat), return; end
 
-        sigma_bx = sigma_cc*sigma_kan;
-        e_T  = (kT-1)/kT;
-        pr_d = tau_v*sigma_bx*pi_k*sigma_kask*sigma_ks;
-        if pr_d<=0, return; end
-        exp_t = (1/pr_d)^e_T;
-        if ~isfinite(exp_t), return; end
+        % (7) 进口总压恢复系数
+        sigma_bx = sigma_cc * sigma_kan;
 
-        trm1 = (kT/(kT-1))*RT_g*T_g*(1-exp_t);
-        den2 = (1+g_T)*eta_k*eta_T*eta_t*eta_m*(1-d);
-        if abs(den2)<1e-10, return; end
-        L_sv = lh*(trm1 - W_k/den2);
-        if ~isfinite(L_sv)||L_sv<=0, return; end
+        % (8) 单位自由能
+        exp_T              = (kT - 1) / kT;
+        expansion_pr_denom = tau_v * sigma_bx * pi_k * sigma_kask * sigma_ks;
+        if expansion_pr_denom <= 0
+            return;
+        end
+        expansion_term = (1.0 / expansion_pr_denom)^exp_T;
+        if ~isfinite(expansion_term)
+            return;
+        end
+        term1         = (kT / (kT - 1)) * RT * T_g * (1 - expansion_term);
+        compress_work = (k_air / (k_air - 1)) * R_air * T_B * (pi_k^((k_air - 1) / k_air) - 1);
+        denom2        = (1 + g_T) * eta_k * eta_T * eta_t * eta_m * (1 - d);
+        if abs(denom2) < 1e-10
+            return;
+        end
+        term2 = compress_work / denom2;
+        L_sv  = lambda_heat * (term1 - term2);
+        if ~isfinite(L_sv) || L_sv <= 0
+            return;
+        end
 
-        num_x = 1 + m*V_f^2/(2*L_sv*eta_tv*eta_v*eta_c2);
-        den_x = 1 + (m*eta_tv*eta_v*eta_c2)/(eta_c1*lambda);
-        if abs(den_x)<1e-10, return; end
-        x_pc = num_x/den_x;
-        if ~isfinite(x_pc)||x_pc<=0||x_pc>=1, return; end
+        % (9) 最优自由能分配系数
+        if L_sv <= 0, return; end
+        V2_term = m * V_flight^2;
+        num_xpc = 1 + V2_term / (2 * L_sv * eta_tv * eta_v * eta_c2);
+        den_xpc = 1 + (m * eta_tv * eta_v * eta_c2) / (eta_c1 * lambda);
+        if abs(den_xpc) < 1e-10, return; end
+        x_pc = num_xpc / den_xpc;
+        if ~isfinite(x_pc) || x_pc <= 0 || x_pc >= 1
+            if x_pc <= 0, return; end
+        end
 
-        sq1 = 2*eta_c1*lambda*x_pc*L_sv;
-        if sq1<0, return; end
-        V_j1 = (1+g_T)*sqrt(sq1)-V_f;
-        sq2  = 2*(1-x_pc)/m*L_sv*eta_tv*eta_v*eta_c2+V_f^2;
-        if sq2<0, return; end
-        V_j2 = sqrt(sq2)-V_f;
+        % (10) 比推力
+        inner_sq1 = 2 * eta_c1 * lambda * x_pc * L_sv;
+        if inner_sq1 < 0, return; end
+        V_j1 = (1 + g_T) * sqrt(inner_sq1) - V_flight;
+        inner_sq2 = 2 * (1 - x_pc) / m * L_sv * eta_tv * eta_v * eta_c2 + V_flight^2;
+        if inner_sq2 < 0, return; end
+        V_j2 = sqrt(inner_sq2) - V_flight;
+        R_ud = (1/(1+m)) * V_j1 + (m/(1+m)) * V_j2;
+        if ~isfinite(R_ud) || R_ud <= 0, return; end
 
-        R_ud = V_j1/(1+m) + m*V_j2/(1+m);
-        if ~isfinite(R_ud)||R_ud<=0, return; end
-        C_ud = 3600*g_T*(1-d)/(R_ud*(1+m));
-        if ~isfinite(C_ud)||C_ud<=0, return; end
+        % (11) 比油耗
+        denom_C = R_ud * (1 + m);
+        if abs(denom_C) < 1e-10, return; end
+        C_ud = 3600 * g_T * (1 - d) / denom_C;
+        if ~isfinite(C_ud) || C_ud <= 0, return; end
 
         y = [R_ud, C_ud];
-        aux.T_B=T_B; aux.T_k=T_k; aux.g_T=g_T;
-        aux.L_sv=L_sv; aux.x_pc=x_pc; aux.lh=lh;
+        aux.T_B         = T_B;
+        aux.T_k         = T_k;
+        aux.tau_v       = tau_v;
+        aux.g_T         = g_T;
+        aux.lambda_heat = lambda_heat;
+        aux.sigma_bx    = sigma_bx;
+        aux.L_sv        = L_sv;
+        aux.x_pc        = x_pc;
+        aux.kT          = kT;
+        aux.RT          = RT;
+        aux.delta       = d;
     catch ME
         warning('engine_forward: %s', ME.message);
     end
@@ -418,101 +471,200 @@ end
 
 %% --- 绘图 ---
 function plot_results(results, theta_true, lb, ub, param_labels)
-    pts   = results.particles;
-    n_p   = size(pts,2);
-    nc    = ceil(n_p/2);
+    pts = results.particles;
+    N   = size(pts,1);
+    n_p = size(pts,2);
 
-    %% 图1: 边缘后验分布
-    fig1 = figure('Name','TMCMC 边缘后验','Position',[50,50,1100,750]);
-    for i=1:n_p
-        subplot(2,nc,i);
-        histogram(pts(:,i),60,'Normalization','pdf', ...
-            'FaceColor',[0.25,0.55,0.90],'EdgeColor','none','FaceAlpha',0.75);
-        hold on;
-        xl = xline(theta_true(i),'g-','LineWidth',2.5,'DisplayName','真值');
-        xm = xline(results.theta_mean(i),'r--','LineWidth',2.0,'DisplayName','后验均值');
-        xp = xline(results.theta_map(i), 'm:','LineWidth',2.0,'DisplayName','MAP');
-        xlim([lb(i),ub(i)]);
-        xlabel(param_labels{i},'FontSize',11,'Interpreter','latex');
-        ylabel('pdf','FontSize',10);
-        title(sprintf('%s\n真值=%.4f  均值=%.4f  MAP=%.4f', ...
-            param_labels{i},theta_true(i), ...
-            results.theta_mean(i),results.theta_map(i)), ...
-            'FontSize',9,'Interpreter','latex');
-        grid on; grid minor;
-        if i==1
-            legend([xl,xm,xp],'Location','best','FontSize',8);
-        end
-    end
-    sgtitle('TMCMC 边缘后验分布','FontSize',13);
+    % 颜色常量
+    col_hist    = [0.08, 0.38, 0.65];   % TMCMC 直方图：深蓝
+    col_prior   = [1.00, 0.75, 0.10];   % 先验：金黄
+    col_kde     = [0.15, 0.75, 0.35];   % 后验KDE：草绿
+    col_scatter = [0.10, 0.65, 0.60];   % 散点：青绿
 
-    %% 图2: 两两联合后验（Corner plot）
-    fig2 = figure('Name','TMCMC 联合后验','Position',[100,30,950,880]);
-    for row=1:n_p
-        for col=1:n_p
-            ax = subplot(n_p, n_p, (row-1)*n_p+col);
-            if row==col
-                % 对角：边缘直方图
-                histogram(pts(:,col),50,'Normalization','pdf', ...
-                    'FaceColor',[0.25,0.55,0.90],'EdgeColor','none','FaceAlpha',0.8);
+    %% ---------------------------------------------------------------
+    %% 图1: Corner plot（仿参考图样式）
+    %%   对角   = 直方图 + 先验(黄) + 后验KDE(绿虚线)
+    %%   上三角 = 散点图（青绿小点）
+    %%   下三角 = 2D KDE 热力图（parula）
+    %% ---------------------------------------------------------------
+    fig2 = figure('Name','TMCMC 联合后验 Corner Plot', ...
+                  'Position',[60, 40, 960, 900]);
+
+    ng = 45;   % KDE 网格分辨率（增大可更平滑，但更慢）
+
+    h_hist=[]; h_prior=[]; h_kde=[];  % 用于图例
+
+    for row = 1:n_p
+        for col = 1:n_p
+            ax = subplot(n_p, n_p, (row-1)*n_p + col);
+
+            if row == col
+                %% ---- 对角：边缘分布 ----
+                % 直方图（TMCMC）
+                h_h = histogram(pts(:,col), 50, 'Normalization','pdf', ...
+                    'FaceColor', col_hist, 'EdgeColor','none', 'FaceAlpha',0.85);
                 hold on;
-                xline(theta_true(col),'g-','LineWidth',2.0);
-                xlim([lb(col),ub(col)]);
-            elseif row>col
-                % 下三角：散点图（密度着色）
-                scatter(pts(:,col),pts(:,row),3,'filled', ...
-                    'MarkerFaceColor',[0.3,0.55,0.88],'MarkerFaceAlpha',0.12);
+                xlims = [lb(col), ub(col)];
+                xlim(xlims);
+
+                % 先验 PDF（均匀 → 水平线）
+                prior_pdf = 1 / (ub(col) - lb(col));
+                xp_vec    = linspace(lb(col), ub(col), 200);
+                h_p = plot(xp_vec, prior_pdf*ones(1,200), '-', ...
+                    'Color', col_prior, 'LineWidth', 2.0);
+
+                % 后验 KDE（绿虚线）
+                x_eval = linspace(lb(col), ub(col), 200);
+                try
+                    [f_kde, xi_kde] = ksdensity(pts(:,col), x_eval);
+                    h_k = plot(xi_kde, f_kde, '--', ...
+                        'Color', col_kde, 'LineWidth', 2.0);
+                catch
+                    h_k = [];
+                end
+
+                % 保存句柄用于图例（只取第1次）
+                if row==1
+                    h_hist  = h_h;
+                    h_prior = h_p;
+                    if ~isempty(h_k), h_kde = h_k; end
+                end
+
+                % 真值竖线
+                xline(theta_true(col), '--', 'Color',[0.3 0.3 0.3], 'LineWidth', 1.2);
+
+                set(ax, 'Box','on');
+                ylabel('pdf','FontSize',8);
+
+            elseif row > col
+                %% ---- 下三角：2D KDE 热力图 ----
+                xg = linspace(lb(col), ub(col), ng);
+                yg = linspace(lb(row), ub(row), ng);
+                [Xg, Yg] = meshgrid(xg, yg);
+                grid_pts  = [Xg(:), Yg(:)];
+                try
+                    f2d = ksdensity([pts(:,col), pts(:,row)], grid_pts);
+                    F2d = reshape(f2d, ng, ng);
+                catch
+                    F2d = zeros(ng, ng);
+                end
+                imagesc(ax, xg, yg, F2d);
+                colormap(ax, parula);
+                set(ax, 'YDir','normal');
                 hold on;
-                plot(theta_true(col),theta_true(row),'r+','MarkerSize',9,'LineWidth',2);
-                xlim([lb(col),ub(col)]);
-                ylim([lb(row),ub(row)]);
+                % 真值交叉标记（白色+号）
+                plot(theta_true(col), theta_true(row), 'w+', ...
+                    'MarkerSize', 9, 'LineWidth', 2.0);
+                xlim([lb(col), ub(col)]);
+                ylim([lb(row), ub(row)]);
+                set(ax, 'Box','on');
+
             else
-                % 上三角：Pearson 相关系数
-                rho = corr(pts(:,col),pts(:,row));
-                text(0.5,0.5,sprintf('\\rho=%.3f',rho), ...
-                    'Units','normalized','HorizontalAlignment','center', ...
-                    'FontSize',10,'FontWeight','bold', ...
-                    'Color', interp1([-1,0,1],[1 0 0;0.8 0.8 0.8;0 0 1],rho));
-                set(ax,'XTick',[],'YTick',[]);
+                %% ---- 上三角：散点图 ----
+                scatter(pts(:,col), pts(:,row), 3, 'filled', ...
+                    'MarkerFaceColor', col_scatter, 'MarkerFaceAlpha', 0.18);
+                hold on;
+                plot(theta_true(col), theta_true(row), 'r+', ...
+                    'MarkerSize', 9, 'LineWidth', 2.0);
+                xlim([lb(col), ub(col)]);
+                ylim([lb(row), ub(row)]);
+                set(ax, 'Box','on');
             end
-            if row==n_p
-                xlabel(param_labels{col},'FontSize',9,'Interpreter','latex');
+
+            % 轴标签：仅最下行显示 x 轴标签，仅最左列显示 y 轴标签
+            if row == n_p
+                xlabel(param_labels{col}, 'FontSize', 9, 'Interpreter','latex');
             end
-            if col==1
-                ylabel(param_labels{row},'FontSize',9,'Interpreter','latex');
+            if col == 1 && row ~= col
+                ylabel(param_labels{row}, 'FontSize', 9, 'Interpreter','latex');
             end
-            set(ax,'FontSize',8);
+            if col == 1 && row == 1
+                ylabel(param_labels{1}, 'FontSize', 9, 'Interpreter','latex');
+            end
+
+            set(ax, 'FontSize', 7, 'TickLength', [0.015 0.015]);
         end
     end
-    sgtitle('TMCMC 两两联合后验分布（下三角=散点，对角=边缘，上三角=相关系数）', ...
-        'FontSize',11);
 
-    %% 图3: beta 演化 + MCMC 接受率
+    % 图例放在图形底部
+    leg_handles = [];
+    leg_labels  = {};
+    if ~isempty(h_prior), leg_handles(end+1) = h_prior; leg_labels{end+1} = '先验分布'; end
+    if ~isempty(h_kde),   leg_handles(end+1) = h_kde;   leg_labels{end+1} = '贝叶斯积分'; end
+    if ~isempty(h_hist),  leg_handles(end+1) = h_hist;  leg_labels{end+1} = 'TMCMC'; end
+    if ~isempty(leg_handles)
+        lgd = legend(leg_handles, leg_labels, ...
+            'Orientation','horizontal', 'FontSize', 10, ...
+            'Location','southoutside', 'Box','on');
+        lgd.Position(2) = 0.01;
+    end
+
+    sgtitle('TMCMC 两两参数联合后验分布', 'FontSize', 12, 'FontWeight','bold');
+
+    %% ---------------------------------------------------------------
+    %% 图2: 单独边缘后验（含统计标注）
+    %% ---------------------------------------------------------------
+    fig1 = figure('Name','TMCMC 边缘后验（详细）', ...
+                  'Position',[50, 50, 1100, 700]);
+    nc = ceil(n_p/2);
+    for i = 1:n_p
+        subplot(2, nc, i);
+        histogram(pts(:,i), 60, 'Normalization','pdf', ...
+            'FaceColor', col_hist, 'EdgeColor','none', 'FaceAlpha',0.80);
+        hold on;
+        xl = xline(theta_true(i),         '-',  'LineWidth', 2.2, 'Color',[0.1 0.7 0.2],  'DisplayName', '真值');
+        xm = xline(results.theta_mean(i), '--', 'LineWidth', 1.8, 'Color',[0.85 0.15 0.1], 'DisplayName', '后验均值');
+        xp = xline(results.theta_map(i),  ':',  'LineWidth', 1.8, 'Color',[0.7  0.1  0.8], 'DisplayName', 'MAP');
+        x_eval = linspace(lb(i), ub(i), 200);
+        try
+            [fk, xk] = ksdensity(pts(:,i), x_eval);
+            plot(xk, fk, '--', 'Color', col_kde, 'LineWidth', 1.5, 'DisplayName','后验KDE');
+        catch; end
+        xlim([lb(i), ub(i)]);
+        xlabel(param_labels{i}, 'FontSize', 11, 'Interpreter','latex');
+        ylabel('pdf', 'FontSize', 10);
+        title(sprintf('%s  真值=%.4f | 均值=%.4f | MAP=%.4f', ...
+            param_labels{i}, theta_true(i), ...
+            results.theta_mean(i), results.theta_map(i)), ...
+            'FontSize', 8.5, 'Interpreter','latex');
+        grid on; grid minor;
+        if i == 1
+            legend('Location','best','FontSize',8);
+        end
+    end
+    sgtitle('TMCMC 边缘后验分布（各参数）', 'FontSize', 12);
+
+    %% ---------------------------------------------------------------
+    %% 图3: beta 演化 + 接受率诊断
+    %% ---------------------------------------------------------------
     fig3 = figure('Name','TMCMC 过程诊断','Position',[200,50,950,380]);
-    subplot(1,2,1);
     ns = results.n_stages;
-    plot(0:ns, results.stage_betas,'bo-','LineWidth',1.8,'MarkerSize',7);
+
+    subplot(1,2,1);
+    plot(0:ns, results.stage_betas, 'bo-', 'LineWidth',1.8, 'MarkerSize',7, ...
+        'MarkerFaceColor','b');
     xlabel('阶段序号','FontSize',11); ylabel('\beta','FontSize',11);
     title('温度参数 \beta 演化','FontSize',12);
     ylim([0,1.05]); grid on; grid minor;
 
     subplot(1,2,2);
-    bar(1:ns, results.acc_hist, 0.6,'FaceColor',[0.3,0.7,0.4]);
+    bar(1:ns, results.acc_hist, 0.6, 'FaceColor',[0.30,0.68,0.38]);
     hold on;
     yline(0.234,'r--','LineWidth',1.5,'DisplayName','最优接受率 0.234');
     xlabel('阶段序号','FontSize',11); ylabel('MCMC 接受率','FontSize',11);
     title('各阶段 MCMC 接受率','FontSize',12);
     ylim([0,1]); grid on; grid minor;
     legend('FontSize',8,'Location','best');
-
     sgtitle('TMCMC 过程诊断','FontSize',12);
 
-    %% 保存图片
+    %% ---------------------------------------------------------------
+    %% 保存
+    %% ---------------------------------------------------------------
     try
-        saveas(fig1,'TMCMC_marginal_posterior.png');
-        saveas(fig2,'TMCMC_joint_posterior.png');
-        saveas(fig3,'TMCMC_diagnostics.png');
-        fprintf('图片已保存：TMCMC_marginal_posterior.png | TMCMC_joint_posterior.png | TMCMC_diagnostics.png\n');
+        saveas(fig2, 'TMCMC_corner_plot.png');
+        saveas(fig1, 'TMCMC_marginal_posterior.png');
+        saveas(fig3, 'TMCMC_diagnostics.png');
+        fprintf('图片已保存：TMCMC_corner_plot.png | TMCMC_marginal_posterior.png | TMCMC_diagnostics.png\n');
     catch
         fprintf('（图片保存失败，可能为无显示环境）\n');
     end
